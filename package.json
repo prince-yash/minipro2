@@ -1,0 +1,21 @@
+{
+  "name": "educanvas-live",
+  "version": "1.0.0",
+  "description": "EduCanvas Live - A real-time collaborative teaching platform with whiteboard, chat, and video conferencing",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd backend && npm run dev",
+    "client": "cd frontend && npm start",
+    "build": "cd frontend && npm run build",
+    "start": "cd backend && npm start",
+    "install-all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["education", "whiteboard", "video-conferencing", "real-time", "collaboration", "socket.io", "webrtc"],
+  "author": "",
+  "license": "ISC"
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
