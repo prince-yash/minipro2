@@ -1,57 +1,15 @@
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+require('dotenv').config();
 
-// Simple JSON-file-based storage for demo purposes
-// Users are stored in backend/data/users.json
-const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const prisma = new PrismaClient();
 
-function ensureDataFile() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(USERS_FILE)) {
-    fs.writeFileSync(USERS_FILE, JSON.stringify([], null, 2), 'utf8');
-  }
-}
-
-function readUsers() {
-  try {
-    ensureDataFile();
-    const raw = fs.readFileSync(USERS_FILE, 'utf8');
-    if (!raw.trim()) return [];
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error('Failed to read users.json, resetting file:', err);
-    return [];
-  }
-}
-
-function writeUsers(users) {
-  try {
-    ensureDataFile();
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Failed to write users.json:', err);
-    throw err;
-  }
-}
-
-function generateId() {
-  return (
-    Date.now().toString(36) + Math.random().toString(36).substring(2, 10)
-  );
-}
-
-// JWT secret from environment
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key-change-me';
 const JWT_EXPIRY = '7d'; // Token expires in 7 days
 
 /**
- * Register a new user (file-based storage)
+ * Register a new user (PostgreSQL via Prisma)
  */
 async function register(req, res) {
   try {
@@ -94,12 +52,15 @@ async function register(req, res) {
       finalRole = 'admin';
     }
 
-    const users = readUsers();
-
     // Check if user already exists
-    const existingUser = users.find(
-      (u) => u.email === email || u.username === username
-    );
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { email: email },
+          { username: username }
+        ]
+      }
+    });
 
     if (existingUser) {
       if (existingUser.email === email) {
@@ -112,28 +73,15 @@ async function register(req, res) {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const now = new Date().toISOString();
-    const user = {
-      id: generateId(),
-      email,
-      username,
-      password: hashedPassword,
-      role: finalRole,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    users.push(user);
-    writeUsers(users);
-
-    // Public user fields
-    const publicUser = {
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      role: user.role,
-      createdAt: user.createdAt,
-    };
+    // Create user in DB
+    const user = await prisma.user.create({
+      data: {
+        email,
+        username,
+        password: hashedPassword,
+        role: finalRole
+      }
+    });
 
     // Generate JWT token
     const token = jwt.sign(
@@ -145,7 +93,13 @@ async function register(req, res) {
     res.status(201).json({
       message: 'User registered successfully',
       token,
-      user: publicUser,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        createdAt: user.createdAt
+      }
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -154,7 +108,7 @@ async function register(req, res) {
 }
 
 /**
- * Login user (file-based storage)
+ * Login user (PostgreSQL via Prisma)
  */
 async function login(req, res) {
   try {
@@ -167,12 +121,15 @@ async function login(req, res) {
         .json({ error: 'Email/username and password are required' });
     }
 
-    const users = readUsers();
-
     // Find user by email or username
-    const user = users.find(
-      (u) => u.email === emailOrUsername || u.username === emailOrUsername
-    );
+    const user = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { email: emailOrUsername },
+          { username: emailOrUsername }
+        ]
+      }
+    });
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -198,8 +155,8 @@ async function login(req, res) {
         id: user.id,
         email: user.email,
         username: user.username,
-        role: user.role,
-      },
+        role: user.role
+      }
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -227,26 +184,27 @@ function verifyToken(req, res, next) {
 }
 
 /**
- * Get current user profile (file-based storage)
+ * Get current user profile (PostgreSQL via Prisma)
  */
 async function getProfile(req, res) {
   try {
-    const users = readUsers();
-    const user = users.find((u) => u.id === req.user.userId);
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId }
+    });
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const publicUser = {
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      role: user.role,
-      createdAt: user.createdAt,
-    };
-
-    res.status(200).json({ user: publicUser });
+    res.status(200).json({
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        createdAt: user.createdAt
+      }
+    });
   } catch (error) {
     console.error('Profile fetch error:', error);
     res.status(500).json({ error: 'Failed to fetch profile' });
