@@ -1,27 +1,72 @@
 const express = require('express');
+const https = require('https');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const { ExpressPeerServer } = require('peer');
+const { register, login, verifyToken, getProfile } = require('./auth');
 
 const app = express();
-const server = http.createServer(app);
+
+// Determine if we should use HTTPS (development) or HTTP (production/Render)
+const useHttps = process.env.NODE_ENV !== 'production' && process.env.USE_HTTPS !== 'false';
+let server;
+
+if (useHttps) {
+  // SSL certificate configuration for development
+  const certsPath = path.join(__dirname, '..', 'certs');
+  const keyPath = path.join(certsPath, 'key.pem');
+  const certPath = path.join(certsPath, 'cert.pem');
+  
+  // Check if certificates exist
+  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+    const sslOptions = {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath)
+    };
+    server = https.createServer(sslOptions, app);
+    console.log('🔒 Using HTTPS for development');
+  } else {
+    console.log('⚠️  SSL certificates not found, falling back to HTTP');
+    server = http.createServer(app);
+  }
+} else {
+  // Use HTTP for production (Render handles SSL termination)
+  server = http.createServer(app);
+  console.log('🌐 Using HTTP for production (SSL handled by load balancer)');
+}
 const io = socketIo(server, {
   cors: {
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST"]
+    origin: process.env.NODE_ENV === 'production' 
+      ? [process.env.FRONTEND_URL, process.env.RENDER_EXTERNAL_URL].filter(Boolean)
+      : (origin, callback) => callback(null, true), // Allow any origin in development
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({ 
+  origin: process.env.NODE_ENV === 'production' 
+    ? [process.env.FRONTEND_URL, process.env.RENDER_EXTERNAL_URL].filter(Boolean)
+    : true, // Allow any origin in development
+  credentials: true 
+}));
 app.use(express.json());
+
+// Trust proxy (required for Render)
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
 
 // In-memory state (no database)
 const appState = {
   admin: null,
-  users: {}, // { socketId: { name, role, streamActive } }
+  users: {}, // { socketId: { name, role, streamActive, canDraw, inVideoCall, peerId } }
   chat: [],
-  drawingEnabled: true,
+  drawingEnabled: true, // global toggle (default: true)
   adminCode: 'teach123'
 };
 
@@ -40,11 +85,14 @@ io.on('connection', (socket) => {
       appState.admin = socket.id;
     }
 
-    // Add user to state
+    // Add user to state (everyone can draw by default)
     appState.users[socket.id] = {
       name,
       role,
-      streamActive: false
+      streamActive: false,
+      canDraw: true,
+      inVideoCall: false,
+      peerId: null
     };
 
     // Join the classroom room
@@ -86,26 +134,96 @@ io.on('connection', (socket) => {
     }
   });
 
-  // WebRTC signaling
-  socket.on('offer', (data) => {
-    socket.to(data.to).emit('offer', {
-      from: socket.id,
-      offer: data.offer
-    });
+  // Jitsi Meet handles all WebRTC signaling internally
+  // No need for manual WebRTC signaling anymore
+
+  // PeerJS video conference events
+  // New peer announces readiness and receives list of existing peers
+  socket.on('peer_ready', (data) => {
+    const { peerId } = data;
+    const user = appState.users[socket.id];
+    if (user) {
+      // Prevent duplicate peer registrations
+      if (user.peerId === peerId) {
+        console.log(`${user.name} already registered with peer ID: ${peerId}`);
+        return;
+      }
+      
+      // If user already has a different peerId, they're reconnecting
+      if (user.peerId) {
+        console.log(`${user.name} changing peer ID from ${user.peerId} to ${peerId}`);
+      }
+      
+      user.inVideoCall = true;
+      user.peerId = peerId;
+
+      // Send list of current peers to this user only
+      const peers = Object.entries(appState.users)
+        .filter(([id, u]) => id !== socket.id && !!u.peerId && u.peerId !== peerId)
+        .map(([id, u]) => ({ peerId: u.peerId, userName: u.name, userRole: u.role }));
+
+      socket.emit('peers_in_room', { peers });
+
+      // Notify others about this join (only if it's a new peer)
+      socket.to('classroom').emit('peer_joined', {
+        peerId,
+        userName: user.name,
+        userRole: user.role
+      });
+
+      console.log(`${user.name} is ready with peer ID: ${peerId}. Informing ${peers.length} peers.`);
+    }
   });
 
-  socket.on('answer', (data) => {
-    socket.to(data.to).emit('answer', {
-      from: socket.id,
-      answer: data.answer
-    });
+  // Clean up duplicate peer IDs from different users
+  socket.on('peer_left', (data) => {
+    const { peerId } = data;
+    const user = appState.users[socket.id];
+    if (user && user.peerId === peerId) {
+      user.inVideoCall = false;
+      user.peerId = null;
+      socket.to('classroom').emit('peer_left', { peerId });
+      console.log(`Peer left video conference: ${peerId}`);
+    }
   });
 
-  socket.on('ice-candidate', (data) => {
-    socket.to(data.to).emit('ice-candidate', {
-      from: socket.id,
-      candidate: data.candidate
-    });
+  // Back-compat: explicit joined event (optional from client)
+  socket.on('peer_joined', (data) => {
+    const { peerId, userName, userRole } = data;
+    const user = appState.users[socket.id];
+    if (user) {
+      user.inVideoCall = true;
+      user.peerId = peerId;
+      socket.to('classroom').emit('peer_joined', { peerId, userName, userRole });
+      console.log(`${userName} joined video conference with peer ID: ${peerId}`);
+    }
+  });
+
+
+
+  // Handle user leaving session manually
+  socket.on('leave_session', () => {
+    console.log(`User ${socket.id} leaving session manually`);
+    const user = appState.users[socket.id];
+    
+    if (user) {
+      // If admin leaves, end session for everyone
+      if (user.role === 'admin') {
+        io.to('classroom').emit('session_ended', { reason: 'Admin left the session' });
+        
+        // Reset app state
+        appState.admin = null;
+        appState.users = {};
+        appState.chat = [];
+        appState.drawingEnabled = true;
+      } else {
+        // Remove user and notify others
+        delete appState.users[socket.id];
+        socket.to('classroom').emit('user_left', { userId: socket.id });
+      }
+    }
+    
+    socket.disconnect();
   });
 
   // Chat system
@@ -143,8 +261,8 @@ io.on('connection', (socket) => {
   socket.on('draw_data', (data) => {
     const user = appState.users[socket.id];
     
-    // Check if drawing is enabled and user has permission
-    if (appState.drawingEnabled || (user && user.role === 'admin')) {
+    // Allow admin always; others only if global drawing is enabled and user is allowed
+    if (user && (user.role === 'admin' || (appState.drawingEnabled && user.canDraw))) {
       socket.to('classroom').emit('draw_data', {
         ...data,
         userId: socket.id
@@ -165,10 +283,47 @@ io.on('connection', (socket) => {
     const { enabled } = data;
     const user = appState.users[socket.id];
 
-    // Only admin can toggle drawing
+    // Only admin can toggle global drawing
     if (user && user.role === 'admin') {
       appState.drawingEnabled = enabled;
       io.to('classroom').emit('drawing_toggled', { enabled });
+    }
+  });
+
+  // Admin: set individual user's draw permission
+  socket.on('set_user_draw', (data) => {
+    const { targetUserId, canDraw } = data;
+    const user = appState.users[socket.id];
+
+    if (user && user.role === 'admin' && appState.users[targetUserId]) {
+      appState.users[targetUserId].canDraw = !!canDraw;
+      io.to('classroom').emit('user_updated', { userId: targetUserId, user: appState.users[targetUserId] });
+    }
+  });
+
+  // Admin: kick a user
+  socket.on('kick_user', (data) => {
+    const { targetUserId } = data;
+    const user = appState.users[socket.id];
+    if (user && user.role === 'admin') {
+      const targetSocket = io.sockets.sockets.get(targetUserId);
+      if (targetSocket) {
+        try {
+          // Inform the user before disconnecting
+          targetSocket.emit('kicked', { reason: 'Removed by admin' });
+        } catch (e) {
+          console.log('Failed to emit kicked to target:', e);
+        }
+        setTimeout(() => {
+          targetSocket.disconnect(true);
+        }, 100);
+      } else {
+        // If socket not found, ensure state is cleaned
+        if (appState.users[targetUserId]) {
+          delete appState.users[targetUserId];
+          io.to('classroom').emit('user_left', { userId: targetUserId });
+        }
+      }
     }
   });
 
@@ -192,6 +347,11 @@ io.on('connection', (socket) => {
     
     const user = appState.users[socket.id];
     if (user) {
+      // If user was in video call, notify peers of peer_left
+      if (user.peerId) {
+        socket.to('classroom').emit('peer_left', { peerId: user.peerId });
+      }
+
       // If admin disconnects, end session for everyone
       if (user.role === 'admin') {
         io.to('classroom').emit('session_ended', { reason: 'Admin left the session' });
@@ -209,6 +369,11 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+// Authentication routes
+app.post('/api/auth/register', register);
+app.post('/api/auth/login', login);
+app.get('/api/auth/profile', verifyToken, getProfile);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -231,8 +396,39 @@ app.get('/state', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-server.listen(PORT, () => {
+// Attach PeerJS to the server
+const peerServer = ExpressPeerServer(server, { 
+  path: '/',
+  debug: process.env.NODE_ENV !== 'production'
+});
+app.use('/peerjs', peerServer);
+
+// Graceful shutdown handling
+const shutdown = (signal) => {
+  console.log(`${signal} received, shutting down gracefully`);
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server.listen(PORT, '0.0.0.0', () => {
+  const protocol = useHttps ? 'https' : 'http';
+  const host = process.env.RENDER_EXTERNAL_URL || `${protocol}://localhost:${PORT}`;
+  
   console.log(`🚀 EduCanvas Live server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📹 PeerJS signaling available at ${host}/peerjs`);
+  console.log(`📊 Health check: ${host}/health`);
   console.log(`🔐 Admin code: ${appState.adminCode}`);
+  
+  if (useHttps) {
+    console.log(`⚠️  Note: Accept self-signed certificate in browser`);
+  }
+  
+  if (process.env.NODE_ENV === 'production') {
+    console.log(`🌐 External URL: ${process.env.RENDER_EXTERNAL_URL}`);
+  }
 });

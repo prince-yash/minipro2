@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
+import AuthPage from './components/AuthPage';
 import LandingPage from './components/LandingPage';
 import Classroom from './components/Classroom';
 
 interface AppState {
   socket: Socket | null;
   isConnected: boolean;
+  isAuthenticated: boolean;
+  authToken: string | null;
   inClassroom: boolean;
   userRole: 'admin' | 'student';
   userName: string;
+  userEmail: string;
   error: string | null;
 }
 
@@ -16,17 +20,54 @@ function App() {
   const [state, setState] = useState<AppState>({
     socket: null,
     isConnected: false,
+    isAuthenticated: false,
+    authToken: null,
     inClassroom: false,
     userRole: 'student',
     userName: '',
+    userEmail: '',
     error: null
   });
 
+  // Check for existing auth token on mount
+  useEffect(() => {
+    const token = localStorage.getItem('authToken');
+    const userStr = localStorage.getItem('user');
+    
+    if (token && userStr) {
+      try {
+        const user = JSON.parse(userStr);
+        setState(prev => ({
+          ...prev,
+          isAuthenticated: true,
+          authToken: token,
+          userName: user.username,
+          userEmail: user.email,
+          userRole: user.role
+        }));
+      } catch (error) {
+        // Invalid stored data, clear it
+        localStorage.removeItem('authToken');
+        localStorage.removeItem('user');
+      }
+    }
+  }, []);
+
   const connectSocket = () => {
-    const newSocket = io('http://localhost:5000');
+    // Use environment variable or construct URL based on current location
+    const host = window.location.hostname;
+    const protocol = window.location.protocol; // Use same protocol as the frontend
+    const backendUrl = (process.env.REACT_APP_BACKEND_URL || `${protocol}//${host}:5000`).replace(/\/$/, '');
+
+    console.log('Connecting to backend:', backendUrl);
+
+    const newSocket = io(backendUrl, {
+      // Accept self-signed certificates in development only
+      rejectUnauthorized: process.env.NODE_ENV === 'production'
+    });
     
     newSocket.on('connect', () => {
-      console.log('Connected to server');
+      console.log('Connected to server', backendUrl);
       setState(prev => ({ ...prev, socket: newSocket, isConnected: true }));
     });
 
@@ -52,8 +93,20 @@ function App() {
     return newSocket;
   };
 
+  const handleAuthSuccess = (token: string, user: { id: string; username: string; email: string; role: string }) => {
+    setState(prev => ({
+      ...prev,
+      isAuthenticated: true,
+      authToken: token,
+      userName: user.username,
+      userEmail: user.email,
+      userRole: user.role as 'admin' | 'student',
+      error: null
+    }));
+  };
+
   const handleJoinClassroom = (name: string, adminCode?: string) => {
-    setState(prev => ({ ...prev, userName: name, error: null }));
+    setState(prev => ({ ...prev, error: null }));
     
     let socket = state.socket;
     if (!socket || !socket.connected) {
@@ -76,12 +129,29 @@ function App() {
     if (state.socket) {
       state.socket.disconnect();
     }
+    setState(prev => ({
+      ...prev,
+      socket: null,
+      isConnected: false,
+      inClassroom: false
+    }));
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('authToken');
+    localStorage.removeItem('user');
+    if (state.socket) {
+      state.socket.disconnect();
+    }
     setState({
       socket: null,
       isConnected: false,
+      isAuthenticated: false,
+      authToken: null,
       inClassroom: false,
       userRole: 'student',
       userName: '',
+      userEmail: '',
       error: null
     });
   };
@@ -116,8 +186,14 @@ function App() {
     );
   }
 
+  // Show auth page if not authenticated
+  if (!state.isAuthenticated) {
+    return <AuthPage onAuthSuccess={handleAuthSuccess} />;
+  }
+
+  // Show landing page if authenticated but not in classroom
   if (!state.inClassroom) {
-    return <LandingPage onJoinClassroom={handleJoinClassroom} />;
+    return <LandingPage onJoinClassroom={handleJoinClassroom} onLogout={handleLogout} userName={state.userName} />;
   }
 
   if (state.socket && state.inClassroom) {

@@ -8,13 +8,19 @@
     "server": "cd backend && npm run dev",
     "client": "cd frontend && npm start",
     "build": "cd frontend && npm run build",
+    "build:backend": "cd backend && npm ci",
+    "build:frontend": "cd frontend && npm ci && npm run build",
     "start": "cd backend && npm start",
+    "start:prod": "NODE_ENV=production cd backend && npm start",
     "install-all": "npm install && cd backend && npm install && cd ../frontend && npm install",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "postinstall": "npm run install-all",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "cd frontend && npm run lint",
+    "deploy:render": "echo \"Deploy using render.yaml blueprint or push to connected Git repo\""
   },
   "keywords": ["education", "whiteboard", "video-conferencing", "real-time", "collaboration", "socket.io", "webrtc"],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
   "devDependencies": {
     "concurrently": "^9.2.1"
   }

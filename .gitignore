@@ -48,3 +48,13 @@ Thumbs.db
 # Temporary folders
 tmp/
 temp/
+
+# Prisma
+backend/generated/
+backend/.env
+backend/prisma.config.ts
+
+# SSL Certificates (development)
+certs/*.pem
+certs/*.key
+certs/*.crt
